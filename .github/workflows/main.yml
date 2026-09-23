@@ -1,122 +1,1239 @@
-name: CDK 挖矿任务
+import httpx
+import json
+import time
+import re
+import base64
+import gzip
+import uuid
+import random
+import os
+import sys
+import threading
+from urllib.parse import urljoin
+from datetime import datetime, timezone
 
-on:
-  workflow_dispatch:
-    inputs:
-      FRONT_IP:
-        description: '前端服务器 IP 地址'
-        required: true
-        type: string
-      THREAD:
-        description: '每个 Job 内的线程数量'
-        required: true
-        type: string
-      JOB_COUNT:
-        description: '并行 Job 数量'
-        required: true
-        type: string
-      REWARD_CAMPAIGN_ID:
-        description: '掉宝活动 UUID（留空=自动解析；获取方法见 README）'
-        required: false
-        type: string
-        default: ''
+# ========== 配置 ==========
+BASE_URL = ""
+CHANNEL_NAME = "wgnt2008"
+MAX_DURATION = 0
+HEARTBEAT_INTERVAL = 30
+SEGMENT_INTERVAL = 10
+DROPS_CHECK_INTERVAL = 60
+SPADE_INTERVAL = 59
 
-jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      front-ip: ${{ steps.config.outputs.front-ip }}
-      thread-count: ${{ steps.config.outputs.thread-count }}
-      job-count: ${{ steps.config.outputs.job-count }}
-      job-indices: ${{ steps.config.outputs.job-indices }}
-      reward-campaign-id: ${{ steps.config.outputs.reward-campaign-id }}
-    steps:
-      - name: 解析参数
-        id: config
-        run: |
-          IP="${{ github.event.inputs.FRONT_IP }}"
-          TH="${{ github.event.inputs.THREAD }}"
-          JC="${{ github.event.inputs.JOB_COUNT }}"
-          RC="${{ github.event.inputs.REWARD_CAMPAIGN_ID }}"
+# 挂宝前先关注直播间（部分活动要求关注）；被挑战关卡挡住时跳过，不阻塞挂宝
+FOLLOW_CHANNEL = True
+# 关注用的持久化查询 hash（网页端同款，实测自写查询文本会被风控区别对待）
+FOLLOW_QUERY_HASH = "800e7346bdf7e5278a3c1d3f21b2b56e2639928f86815677a7126b093b2fdd08"
 
-          if [ -z "$IP" ]; then
-            echo "错误: FRONT_IP 不能为空"
-            exit 1
-          fi
-          if ! [[ "$TH" =~ ^[0-9]+$ ]] || [ "$TH" -lt 1 ]; then
-            echo "错误: THREAD 不合法 ($TH)"
-            exit 1
-          fi
-          if ! [[ "$JC" =~ ^[0-9]+$ ]] || [ "$JC" -lt 1 ]; then
-            echo "错误: JOB_COUNT 不合法 ($JC)"
-            exit 1
-          fi
-          if [ -n "$RC" ] && ! [[ "$RC" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            echo "错误: REWARD_CAMPAIGN_ID 不是合法 UUID ($RC)"
-            exit 1
-          fi
+# 挂宝目标奖励（换活动只改这里）
+REWARD_NAME = "Corrupted Creeper Cape"
+# 活动 ID 兜底：活动 UUID 每期都会变，留空则由运行时按奖励名反查频道活动列表
+# 也可运行时覆盖：命令行第 3 个参数 或 环境变量 REWARD_CAMPAIGN_ID
+REWARD_CAMPAIGN_ID = ""
+# 挂机时长自动检测：按本期活动要求的分钟数挂，多挂几分钟兜底等 Twitch 结算
+FARM_MARGIN_MINUTES = 3
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
-          echo "front-ip=${IP}" >> $GITHUB_OUTPUT
-          echo "thread-count=${TH}" >> $GITHUB_OUTPUT
-          echo "job-count=${JC}" >> $GITHUB_OUTPUT
-          echo "reward-campaign-id=${RC}" >> $GITHUB_OUTPUT
+# 后端 API 配置
+API_AUTH_TOKEN = "twitch-cdk-api-token-2024"
+WORKER_ID = "cdk_worker_http"
+HEARTBEAT_API_INTERVAL = 30
 
-          INDICES=$(python3 -c "import json; print(json.dumps(list(range(int('$JC')))))")
-          echo "job-indices=${INDICES}" >> $GITHUB_OUTPUT
+# 取号队列配置
+CLAIM_QUEUE_PAUSE = 30       # 取号出错暂停 30s
 
-  worker:
-    needs: prepare
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        idx: ${{ fromJson(needs.prepare.outputs.job-indices) }}
-      fail-fast: false
-      max-parallel: 10
+# Twitch API 固定参数
+CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+CLIENT_VERSION = "a54467d0-815e-46db-b05d-1b4c6ac650b2"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+GQL_URL = "https://gql.twitch.tv/gql"
+INTEGRITY_URL = "https://gql.twitch.tv/integrity"
+PLAYER_STATS_URL = "https://player.stats.live-video.net/"
+USHER_URL = "https://usher.ttvnw.net/api/v2/channel/hls/{channel}.m3u8"
 
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
 
-      - name: 安装 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+# ========== 取号队列 ==========
 
-      - name: 拉取执行脚本
-        env:
-          REPO_PAT: ${{ secrets.PRIVATE_REPO_PAT }}
-        run: |
-          git clone --quiet --depth 1 \
-            "https://x-access-token:${REPO_PAT}@github.com/xbox-cn/Tw_Cdk.git" \
-            _runner
+class ClaimQueue:
+    """取号队列：严格串行，同一时间只有一个线程在取号（含网络往返）；出错暂停30s"""
 
-      - name: 安装 Python 依赖
-        run: |
-          pip install --upgrade pip
-          pip install httpx
+    def __init__(self, pause_on_error=30):
+        self._lock = threading.Lock()
+        self._pause_on_error = pause_on_error
+        self._paused_until = 0.0
 
-      - name: 执行 CDK 挖矿（Job #${{ matrix.idx }}）
-        env:
-          PYTHONUNBUFFERED: "1"
-          REWARD_CAMPAIGN_ID: ${{ needs.prepare.outputs.reward-campaign-id }}
-        run: |
-          cd _runner
-          python3 -u main.py ${{ needs.prepare.outputs.front-ip }} ${{ needs.prepare.outputs.thread-count }} 2>&1 | while IFS= read -r line; do
-            if [[ "$line" =~ CDK[[:space:]]*[=:][[:space:]]*([A-Z0-9][A-Z0-9-]+) ]]; then
-              echo "::add-mask::${BASH_REMATCH[1]}"
-            fi
-            echo "$line"
-          done
+    def acquire(self):
+        """获取取号锁，阻塞直到轮到本线程且不在暂停期"""
+        while True:
+            self._lock.acquire()
+            now = time.time()
+            if now >= self._paused_until:
+                return
+            wait = self._paused_until - now
+            self._lock.release()
+            time.sleep(min(wait, 1.0))
 
-  summary:
-    needs: [prepare, worker]
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: 完成
-        run: |
-          echo "全部 CDK 挖矿任务执行完毕。"
-          echo "FRONT_IP: ${{ needs.prepare.outputs.front-ip }}"
-          echo "线程数: ${{ needs.prepare.outputs.thread-count }}"
-          echo "Job 数: ${{ needs.prepare.outputs.job-count }}"
-          echo "活动 ID: ${{ needs.prepare.outputs.reward-campaign-id || '自动解析' }}"
+    def release(self):
+        """释放取号锁，允许下一个线程取号"""
+        self._lock.release()
+
+    def report_error(self, status_code=None, is_timeout=False):
+        """上报取号错误，触发暂停（须在持有锁时调用）"""
+        self._paused_until = time.time() + self._pause_on_error
+        if status_code:
+            reason = f"HTTP {status_code}"
+        elif is_timeout:
+            reason = "连接超时"
+        else:
+            reason = "未知错误"
+        print(f"[取号队列] 检测到错误({reason})，暂停取号 {self._pause_on_error}s")
+
+
+# 全局取号队列实例
+claim_queue = ClaimQueue(pause_on_error=CLAIM_QUEUE_PAUSE)
+
+
+# ========== 后端 API 辅助函数 ==========
+
+def api_headers():
+    return {
+        "Authorization": f"Bearer {API_AUTH_TOKEN}",
+        "X-Worker-Id": WORKER_ID,
+        "Content-Type": "application/json",
+    }
+
+
+def fetch_idle_account(api_client):
+    """从后端获取空闲账号（严格串行：上一个取完，下一个才取）"""
+    for attempt in range(3):
+        claim_queue.acquire()
+        try:
+            resp = api_client.get(f"{BASE_URL}/api/accounts/get_idle", headers=api_headers(), timeout=30)
+            if resp.status_code == 500:
+                claim_queue.report_error(status_code=500)
+                continue
+            if resp.status_code == 404:
+                return None
+            data = resp.json()
+            if data.get("code") == 0:
+                return data.get("data", {})
+        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout):
+            claim_queue.report_error(is_timeout=True)
+        except Exception as e:
+            print(f"  [!] 获取空闲账号失败 (尝试 {attempt+1}/3): {e}")
+        finally:
+            claim_queue.release()
+        if attempt < 2:
+            time.sleep(3)
+    return None
+
+
+def send_heartbeat(api_client, worker_name):
+    try:
+        resp = api_client.post(f"{BASE_URL}/api/workers/heartbeat",
+                               json={"worker_name": worker_name, "worker_type": "cdk"},
+                               headers=api_headers())
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def report_cdk(api_client, cdk_code, account_id, worker_name=""):
+    try:
+        resp = api_client.post(f"{BASE_URL}/api/cdks/claim",
+                               json={"cdk_code": cdk_code, "game_name": "Minecraft", "account_id": account_id},
+                               headers=api_headers())
+        ok = resp.json().get("code") == 0
+    except Exception:
+        ok = False
+    if not ok:
+        print(f"[{worker_name or '?'}] [!] CDK 上报失败，请手工补录: {mask_cdk(cdk_code)}")
+    return ok
+
+
+def remove_invalid_account(api_client, account_id):
+    try:
+        resp = api_client.post(f"{BASE_URL}/api/accounts/{account_id}/remove", headers=api_headers())
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def update_account_status(api_client, account_id, status, worker_name=""):
+    try:
+        resp = api_client.post(f"{BASE_URL}/api/accounts/update_status",
+                               json={"account_id": account_id, "status": status},
+                               headers=api_headers())
+        ok = resp.status_code == 200
+    except Exception:
+        ok = False
+    if not ok:
+        print(f"[{worker_name or '?'}] [!] 账号状态上报失败: {status} (account_id={account_id})")
+    return ok
+
+
+def mask_cdk(code):
+    if not code or len(code) <= 10:
+        return "***"
+    return code[:5] + "***" + code[-5:]
+
+
+# ========== Cookie 转换 ==========
+
+def convert_cookie(cookie):
+    new_cookie = {
+        "name": cookie.get("name"),
+        "value": cookie.get("value"),
+        "domain": cookie.get("domain"),
+        "path": cookie.get("path", "/"),
+        "httpOnly": cookie.get("httpOnly", False),
+        "secure": cookie.get("secure", False),
+    }
+    expires = cookie.get("expires")
+    if expires is not None and expires != -1:
+        new_cookie["expirationDate"] = expires
+    same_site = cookie.get("sameSite", "unspecified")
+    if same_site == "None":
+        new_cookie["sameSite"] = "no_restriction"
+    elif same_site == "Lax":
+        new_cookie["sameSite"] = "lax"
+    elif same_site == "Strict":
+        new_cookie["sameSite"] = "strict"
+    else:
+        new_cookie["sameSite"] = "unspecified"
+    return new_cookie
+
+
+def convert_cookies(cookies_data):
+    if isinstance(cookies_data, str):
+        cookies_data = json.loads(cookies_data)
+    return [convert_cookie(c) for c in cookies_data]
+
+
+def extract_cookie_values(raw_cookies):
+    auth_token = None
+    unique_id = None
+    user_login = None
+    user_id = None
+    for c in raw_cookies:
+        if c["name"] == "auth-token":
+            auth_token = c["value"]
+        elif c["name"] == "unique_id":
+            unique_id = c["value"]
+        elif c["name"] == "twilight-user":
+            try:
+                import urllib.parse
+                decoded = urllib.parse.unquote(c["value"])
+                data = json.loads(decoded)
+                user_login = data.get("login", "")
+                user_id = data.get("id", "")
+            except Exception:
+                pass
+    return auth_token, unique_id, user_login, user_id
+
+
+def get_client_integrity(client, auth_token, device_id):
+    resp = client.post(INTEGRITY_URL, json={}, headers={
+        "Authorization": f"OAuth {auth_token}",
+        "Client-Id": CLIENT_ID,
+        "x-device-id": device_id,
+        "Client-Version": CLIENT_VERSION,
+        "Client-Session-Id": device_id[:16],
+        "Referer": "https://www.twitch.tv/",
+    }, timeout=30)
+    if resp.status_code == 401:
+        return None  # 明确返回 None 表示认证失败
+    return resp.json().get("token", "")
+
+
+def gql_request(client, auth_token, device_id, client_integrity, operations):
+    headers = {
+        "Authorization": f"OAuth {auth_token}",
+        "Client-Id": CLIENT_ID,
+        "x-device-id": device_id,
+        "Client-Version": CLIENT_VERSION,
+        "Client-Session-Id": device_id[:16],
+        "Content-Type": "application/json",
+    }
+    if client_integrity:
+        headers["Client-Integrity"] = client_integrity
+    resp = client.post(GQL_URL, json=operations, headers=headers, timeout=60)
+    if resp.status_code != 200:
+        return None
+    return resp.json()
+
+
+def gql_request_raw(client, auth_token, device_id, client_integrity, operations):
+    """同 gql_request，但返回 (json_data, status_code) 以便检测 401"""
+    headers = {
+        "Authorization": f"OAuth {auth_token}",
+        "Client-Id": CLIENT_ID,
+        "x-device-id": device_id,
+        "Client-Version": CLIENT_VERSION,
+        "Client-Session-Id": device_id[:16],
+        "Content-Type": "application/json",
+    }
+    if client_integrity:
+        headers["Client-Integrity"] = client_integrity
+    resp = client.post(GQL_URL, json=operations, headers=headers, timeout=60)
+    try:
+        return resp.json(), resp.status_code
+    except Exception:
+        return None, resp.status_code
+
+
+def get_channel_info(client, auth_token, device_id, client_integrity, channel_name):
+    ops = [{
+        "operationName": "StreamMetadata",
+        "variables": {"channelLogin": channel_name},
+        "extensions": {"persistedQuery": {"version": 1, "sha256Hash": "1c719a40e481453e5c48d9bb585d971b8b372f8ebb105b17076722264dfa5b3e"}},
+    }]
+    result = gql_request(client, auth_token, device_id, client_integrity, ops)
+    if result and len(result) > 0:
+        data = result[0].get("data", {})
+        user = data.get("user", {}) or data.get("stream", {})
+        return user.get("id", "")
+    return ""
+
+
+def follow_channel(auth_token, device_id, channel_id):
+    """关注直播间。成功（含已关注）返回 ""，失败返回原因
+
+    配方来自已验证实现，缺一项都会被 Twitch 拒：
+      1) 取 integrity 令牌时必须带 X-Device-Id，才拿到设备绑定令牌；
+         不带则拿到设备无关的低信任令牌，调 gql 必被 IntegrityCheckFailed 拒
+      2) 关注请求带 X-Device-Id + Client-Integrity，走网页端同款持久化查询 hash
+      3) 不带 cookie（网页端该请求是 credentials:'omit'）
+      4) 只用官方 /integrity 端点发的令牌，伪造的会被判机器人
+    部分账号会被下发 challenge-gates（kind=phone-verification），是账号级关卡，由调用方跳过。
+    """
+    base = {"Client-Id": CLIENT_ID, "X-Device-Id": device_id}
+    integrity = ""
+    try:
+        with httpx.Client(headers={"User-Agent": USER_AGENT}, verify=False, timeout=30) as c:
+            try:
+                r = c.post(INTEGRITY_URL, json={},
+                           headers=dict(base, Authorization=f"OAuth {auth_token}"))
+                integrity = (r.json() or {}).get("token", "") or ""
+            except Exception:
+                pass
+            headers = dict(base, Authorization=f"OAuth {auth_token}",
+                           **{"Content-Type": "application/json"})
+            if integrity:
+                headers["Client-Integrity"] = integrity
+            body = [{
+                "operationName": "FollowButton_FollowUser",
+                "variables": {"input": {"disableNotifications": False, "targetID": str(channel_id)}},
+                "extensions": {"persistedQuery": {"version": 1, "sha256Hash": FOLLOW_QUERY_HASH}},
+            }]
+            resp = c.post(GQL_URL, json=body, headers=headers, timeout=30)
+    except Exception as e:
+        return f"请求异常: {e}"
+
+    tag = f"integrity={len(integrity)}"
+    if resp.status_code == 401:
+        return f"Cookie 失效(401)"
+    try:
+        data = resp.json()
+    except Exception:
+        return f"返回非 JSON(http={resp.status_code})"
+    item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+    payload = (item.get("data") or {}).get("followUser") or {}
+    if payload.get("follow"):
+        return ""
+    err = payload.get("error") or {}
+    code = str(err.get("code") or "").upper()
+    if "ALREADY" in code:
+        return ""  # 已关注按成功处理（幂等）
+    if err:
+        return f"{code} {tag}"
+    errors = item.get("errors")
+    if errors:
+        msg = json.dumps(errors, ensure_ascii=False)
+        kind = str(((item.get("extensions") or {}).get("challenge") or {}).get("kind") or "").strip()
+        if kind:
+            return f"需要验证({kind}) {tag}"
+        if "requires challenge" in msg:
+            return f"需要验证(requires challenge) {tag}"
+        if "integrity" in msg.lower():
+            return f"integrity 校验失败 {tag}"
+        return f"接口报错: {msg[:150]}"
+    return f"未知返回 {tag}"
+
+
+def get_playback_access_token(client, auth_token, device_id, client_integrity, channel_name):
+    ops = [{
+        "operationName": "PlaybackAccessToken_Template",
+        "query": 'query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!, $platform: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: $platform, playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) { value signature authorization { isForbidden forbiddenReasonCode } __typename } videoPlaybackAccessToken(id: $vodID, params: {platform: $platform, playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) { value signature __typename } }',
+        "variables": {"isLive": True, "login": channel_name, "isVod": False, "vodID": "", "playerType": "site", "platform": "web"},
+    }]
+    result = gql_request(client, auth_token, device_id, client_integrity, ops)
+    if result and len(result) > 0:
+        access_data = result[0].get("data", {}).get("streamPlaybackAccessToken", {})
+        return access_data.get("value"), access_data.get("signature")
+    return None, None
+
+
+def get_hls_playlist(client, channel_name, token, sig):
+    params = {
+        "allow_source": "true", "browser_family": "chrome", "browser_version": "145.0",
+        "cdm": "wv", "fast_bread": "true", "lang": "en", "os_name": "Windows",
+        "os_version": "NT 10.0", "p": random.randint(100000, 999999), "platform": "web",
+        "play_session_id": uuid.uuid4().hex, "player_backend": "mediaplayer",
+        "player_version": "1.53.0-rc.1", "playlist_include_framerate": "true",
+        "reassignments_supported": "true", "sig": sig,
+        "supported_codecs": "av1,h265,h264", "token": token, "transcode_mode": "cbr_v1",
+    }
+    resp = client.get(USHER_URL.format(channel=channel_name), params=params, timeout=15)
+    if resp.status_code != 200:
+        return None
+    return resp.text
+
+
+def parse_m3u8_segments(m3u8_content, base_url):
+    segments = []
+    for line in m3u8_content.strip().split("\n"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            segments.append(line if line.startswith("http") else urljoin(base_url, line))
+    return segments
+
+
+def select_best_quality_playlist(master_m3u8, base_url):
+    best_url, best_bandwidth, current_bandwidth = None, 0, 0
+    for line in master_m3u8.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("#EXT-X-STREAM-INF"):
+            m = re.search(r"BANDWIDTH=(\d+)", line)
+            if m:
+                current_bandwidth = int(m.group(1))
+        elif line and not line.startswith("#"):
+            if current_bandwidth > best_bandwidth:
+                best_bandwidth = current_bandwidth
+                best_url = line if line.startswith("http") else urljoin(base_url, line)
+            current_bandwidth = 0
+    return best_url
+
+
+def download_segment(client, url):
+    try:
+        with client.stream("GET", url, timeout=15) as resp:
+            size = 0
+            for chunk in resp.iter_bytes(chunk_size=8192):
+                size += len(chunk)
+            return size
+    except Exception:
+        return 0
+
+
+def send_player_stats(client, event, device_id, play_session_id, channel_name):
+    props = {
+        "audio_codec": "aac", "backend": "mediaplayer", "browser_family": "chrome",
+        "browser_version": "145.0", "buffer_empty_count": 0, "build_dist_id": "npm",
+        "catch_up_mode": "none", "channel_id": channel_name, "client_app": "twilight",
+        "client_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{random.randint(100, 999)}Z",
+        "core_version": "1.53.0-rc.1", "device_id": device_id,
+        "device_manufacturer": "", "device_model": "", "domain": "twitch.tv",
+        "hidden": False, "host": "www.twitch.tv", "initial_buffer_duration": 2000,
+        "minutes_logged": 0, "mobile_connection_type": "unknown", "muted": False,
+        "os_name": "Windows", "os_version": "NT 10.0", "platform": "web",
+        "play_session_id": play_session_id, "player": "site", "protocol": "hls",
+        "quality": "auto", "supported_video_codecs": "av01,mp4,hevc,avc",
+        "time": time.time(), "transcoder_version": "",
+        "url": f"https://www.twitch.tv/{channel_name}", "user_agent": USER_AGENT,
+        "video_buffer_size": random.randint(2, 8), "video_codec": "avc",
+        "vod_timestamp": 0, "volume": 1,
+    }
+    data = {"event": event, "properties": props}
+    payload = base64.b64encode(json.dumps(data).encode()).decode()
+    client.post(PLAYER_STATS_URL, content=payload, timeout=10)
+
+
+# ========== Spade 事件上报（推动挂宝进度的关键） ==========
+
+def send_spade_events(client, auth_token, device_id, client_integrity,
+                       channel_name, channel_id, play_session_id,
+                       tab_session_id, app_session_id, seconds_watched,
+                       user_login, user_id,
+                       stream_game_name="Minecraft", stream_game_id="27471",
+                       broadcast_id="316005031922"):
+    """发送 Spade 事件告诉 Twitch 你正在观看直播"""
+
+    event = {
+        "event": "minute-watched",
+        "properties": {
+            "broadcast_id": str(broadcast_id),
+            "channel_id": str(channel_id),
+            "channel": channel_name,
+            "client_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{random.randint(100, 999)}Z",
+            "game": stream_game_name,
+            "game_id": str(stream_game_id),
+            "hidden": False,
+            "is_live": True,
+            "live": True,
+            "logged_in": True,
+            "minutes_logged": 1,
+            "muted": False,
+            "user_id": user_id,
+        }
+    }
+
+    events_json = json.dumps([event], separators=(",", ":"))
+    compressed = gzip.compress(events_json.encode())
+    b64 = base64.b64encode(compressed).decode()
+
+    ops = [{
+        "query": "\n  mutation SendEvents($input: SendSpadeEventsInput!) {\n    sendSpadeEvents(input: $input) {\n      statusCode\n    }\n  }\n",
+        "variables": {
+            "input": {
+                "data": b64,
+                "repository": "twilight",
+                "encoding": "GZIP_B64"
+            }
+        }
+    }]
+    result = gql_request(client, auth_token, device_id, client_integrity, ops)
+    if result and len(result) > 0:
+        return result[0].get("data", {}).get("sendSpadeEvents", {}).get("statusCode")
+    return None
+
+
+# ========== 挂宝 (Drops) 相关 ==========
+
+def get_inventory(client, auth_token, device_id, client_integrity):
+    """查询用户已获得的奖励列表"""
+    ops = [{
+        "operationName": "Inventory",
+        "variables": {"fetchRewardCampaigns": True},
+        "extensions": {"persistedQuery": {"version": 1, "sha256Hash": "8337eb8541b314040b0edde0c09c5c7a2783ba1960aa9edfbf3bac16d0fec404"}}
+    }]
+    result = gql_request(client, auth_token, device_id, client_integrity, ops)
+    if result and len(result) > 0:
+        data = result[0].get("data", {})
+        inventory = data.get("currentUser", {}).get("inventory", {}) or {}
+        return inventory
+    return {}
+
+
+def has_earned_reward(inventory, reward_name):
+    """检查库存中是否已有某个奖励"""
+    earned = inventory.get("earnedDropRewards", {}).get("edges", [])
+    for e in earned:
+        if not isinstance(e, dict):
+            continue
+        node = e.get("node", {})
+        item = node.get("item", {}) or {}
+        if item.get("name") == reward_name:
+            return True
+    return False
+
+
+def get_channel_drops_campaigns(client, auth_token, device_id, client_integrity, channel_id):
+    ops = [{
+        "operationName": "ChannelDropsCampaigns",
+        "variables": {"channelID": channel_id},
+        "extensions": {"persistedQuery": {"version": 1, "sha256Hash": "fc300a8a0d30c710b4e4df5693ebdbfc158fd8e011e503a0e63b656eac869496"}},
+    }]
+    result = gql_request(client, auth_token, device_id, client_integrity, ops)
+    return result[0].get("data", {}) if (result and len(result) > 0) else {}
+
+
+def find_target_campaign(client, auth_token, device_id, client_integrity, channel_id, reward_name):
+    """按奖励名在频道活动列表里找目标活动，返回 (活动ID, 活动名, 所需分钟)"""
+    try:
+        data = get_channel_drops_campaigns(client, auth_token, device_id, client_integrity, channel_id)
+        for camp in (data.get("channelDropCampaigns") or []):
+            if not isinstance(camp, dict):
+                continue
+            for rg in (camp.get("rewardGroups") or []):
+                if not isinstance(rg, dict):
+                    continue
+                rewards = [r.get("name", "") for r in (rg.get("rewards") or []) if isinstance(r, dict)]
+                if reward_name in rewards:
+                    reqs = (rg.get("progressCriteria") or {}).get("requirements") or {}
+                    return (camp.get("id", "") or "",
+                            camp.get("name", "") or "",
+                            reqs.get("minutesWatched", 0) or 0)
+    except Exception:
+        pass
+    return "", "", 0
+
+
+def resolve_reward_campaign_id(client, auth_token, device_id, client_integrity, channel_id, reward_name):
+    """按奖励名从频道活动列表反查活动 ID（活动 UUID 每期都会变，写死会失效）"""
+    return find_target_campaign(client, auth_token, device_id, client_integrity, channel_id, reward_name)[0]
+
+
+def get_self_progress_minutes(client, auth_token, device_id, client_integrity, channel_id, reward_name):
+    """读该账号在目标活动上已挂的分钟数（服务端数据，跨会话累计）"""
+    try:
+        data = get_drops_progress(client, auth_token, device_id, client_integrity, channel_id)
+        for camp in (data.get("channelDropCampaignsProgress") or []):
+            if not isinstance(camp, dict):
+                continue
+            for rg in (camp.get("rewardGroups") or []):
+                if not isinstance(rg, dict):
+                    continue
+                rewards = [r.get("name", "") for r in (rg.get("rewards") or []) if isinstance(r, dict)]
+                if reward_name in rewards:
+                    return int(((rg.get("self") or {}).get("currentMinutesWatched") or 0))
+    except Exception:
+        pass
+    return 0
+
+
+_target_logged = False
+
+
+def log_target_once(campaign_id, campaign_name, required_min):
+    """首次定位到目标活动时打印一次，方便直接复制活动 ID"""
+    global _target_logged
+    if _target_logged or not campaign_id:
+        return
+    _target_logged = True
+    print(f"\n[活动] 目标奖励: {REWARD_NAME}")
+    print(f"  活动 ID: {campaign_id}")
+    if campaign_name:
+        print(f"  活动名: {campaign_name}")
+    if required_min:
+        print(f"  需观看: {required_min} 分钟")
+    print("  换活动时把这条活动 ID 填到 REWARD_CAMPAIGN_ID（或 cdk.yml 的输入框）即可")
+
+
+def get_target_campaign_id(client, auth_token, device_id, client_integrity, channel_id, campaign_id):
+    """库存里的 campaign.id 优先；缺失时按奖励名反查；最后才用配置里的兜底 ID"""
+    return (campaign_id
+            or resolve_reward_campaign_id(client, auth_token, device_id, client_integrity, channel_id, REWARD_NAME)
+            or REWARD_CAMPAIGN_ID)
+
+
+def get_drops_progress(client, auth_token, device_id, client_integrity, channel_id):
+    ops = [{
+        "operationName": "DropChannelCampaignsProgress",
+        "variables": {"channelID": channel_id},
+        "extensions": {"persistedQuery": {"version": 1, "sha256Hash": "ec6d1267667ef9e0bfbe11eef9e04e344b0a5384c4300dc685e75c27ac7b5a0b"}},
+    }]
+    result = gql_request(client, auth_token, device_id, client_integrity, ops)
+    return result[0].get("data", {}) if (result and len(result) > 0) else {}
+
+
+def format_drops_info(drops_data):
+    if not drops_data:
+        return ["  (无挂宝数据)"]
+
+    lines = []
+
+    # 优先解析 channelDropCampaignsProgress（包含 self 进度）
+    progress_list = drops_data.get("channelDropCampaignsProgress")
+    if isinstance(progress_list, list) and len(progress_list) > 0:
+        for camp in progress_list:
+            if not isinstance(camp, dict):
+                continue
+            name = camp.get("name", "未知活动")
+            game = camp.get("game", {}) or {}
+            game_name = game.get("name", "")
+            start = camp.get("startAt", "")
+            end = camp.get("endAt", "")
+            time_range = f" ~{end[:10]}" if end else ""
+
+            # 从 rewardGroups 中提取每个 group 的进度
+            for rg in camp.get("rewardGroups", []):
+                if not isinstance(rg, dict):
+                    continue
+                rg_name = rg.get("name", "")
+                criteria = rg.get("progressCriteria", {}) or {}
+                reqs = criteria.get("requirements", {}) or {}
+                required_min = reqs.get("minutesWatched", 0)
+                self_data = rg.get("self", {}) or {}
+                current_min = self_data.get("currentMinutesWatched") or 0
+                status = self_data.get("status", "")
+
+                rewards = [r.get("name", "") for r in rg.get("rewards", []) if isinstance(r, dict)]
+                reward_str = f" -> {', '.join(rewards)}" if rewards else ""
+
+                if current_min > 0 and required_min > 0:
+                    pct_line = f"{current_min}/{required_min}min"
+                elif required_min > 0:
+                    pct_line = f"0/{required_min}min [{status}]"
+                elif status:
+                    pct_line = f"[{status}]"
+                else:
+                    pct_line = ""
+
+                game_str = f" [{game_name}]" if game_name else ""
+                time_str = f" ({start[:10]}{time_range})" if start else ""
+                lines.append(f"    * {name}{game_str}{time_str}{reward_str}  {pct_line}")
+    else:
+        # 回退解析 channelDropCampaigns（无进度信息）
+        channel_campaigns = drops_data.get("channelDropCampaigns", [])
+        if isinstance(channel_campaigns, list):
+            for camp in channel_campaigns:
+                if not isinstance(camp, dict):
+                    continue
+                name = camp.get("name", "未知活动")
+                game = camp.get("game", {}) or {}
+                game_name = game.get("name", "")
+                start = camp.get("startAt", "")
+                end = camp.get("endAt", "")
+                time_range = f" ~{end[:10]}" if end else ""
+                reward_groups = camp.get("rewardGroups", [])
+                required_min = 0
+                rewards_list = []
+                for rg in reward_groups:
+                    if isinstance(rg, dict):
+                        criteria = rg.get("progressCriteria", {}) or {}
+                        reqs = criteria.get("requirements", {}) or {}
+                        required_min = max(required_min, reqs.get("minutesWatched", 0))
+                        for r in rg.get("rewards", []):
+                            if isinstance(r, dict):
+                                rewards_list.append(r.get("name", ""))
+                reward_str = f" -> {', '.join(rewards_list)}" if rewards_list else ""
+                pct_line = f"0/{required_min}min" if required_min else ""
+                game_str = f" [{game_name}]" if game_name else ""
+                time_str = f" ({start[:10]}{time_range})" if start else ""
+                lines.append(f"    * {name}{game_str}{time_str}{reward_str}  {pct_line}")
+
+    if not lines:
+        lines.append("  (暂无可用挂宝)")
+    return lines
+
+
+def claim_reward_code(client, auth_token, device_id, client_integrity, reward_campaign_id, reward_id):
+    """获取已完成的挂宝 CDK 兑换码，返回 (parsed, raw)"""
+    ops = [{
+        "operationName": "RewardCodeModal",
+        "variables": {
+            "rewardCampaignID": reward_campaign_id,
+            "rewardID": reward_id,
+        },
+        "extensions": {
+            "persistedQuery": {
+                "version": 1,
+                "sha256Hash": "b48d2bd6e80366684092d14c97ced7a86497246c4dab0f3d877c7a308eefdd7f",
+            }
+        },
+    }]
+    result = gql_request(client, auth_token, device_id, client_integrity, ops)
+    raw = result[0] if (result and len(result) > 0) else (result or {})
+    if result and len(result) > 0:
+        data = result[0].get("data", {})
+        inventory = data.get("currentUser", {}).get("inventory", {}) or {}
+        reward_value = inventory.get("rewardValue", {}) or {}
+        parsed = {
+            "code": reward_value.get("value", ""),
+            "expires": reward_value.get("expiresAt", ""),
+        }
+    else:
+        parsed = {}
+    return parsed, raw
+
+
+def try_claim_all_rewards(client, auth_token, device_id, client_integrity, channel_id):
+    """尝试领取 Corrupted Creeper Cape CDK（优先检查库存，检测缺货）
+    返回: (codes, status)
+      status: "claimed" | "out_of_stock" | "not_earned" | "error"
+    """
+    try:
+        campaign_data = get_channel_drops_campaigns(client, auth_token, device_id, client_integrity, channel_id)
+        campaigns = campaign_data.get("channelDropCampaigns", []) if campaign_data else []
+    except Exception as e:
+        print(f"\n[!] 领取检查异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return [], "error"
+
+    # 先查库存有没有 Corrupted Creeper Cape
+    try:
+        inventory = get_inventory(client, auth_token, device_id, client_integrity)
+        has_cape = has_earned_reward(inventory, REWARD_NAME)
+    except Exception as e:
+        print(f"\n[!] 库存检查异常: {e}")
+        has_cape = False
+
+    # 库存里没有 Corrupted Creeper Cape → 尚未挂满，不用尝试领取
+    if not has_cape:
+        return [], "not_earned"
+
+
+def check_and_claim_drops(client, auth_token, device_id, client_integrity, channel_id, elapsed_seconds=0):
+    """以 Inventory 接口为准：只有当 earnedDropRewards 里有 Corrupted Creeper Cape 才算挂到"""
+
+    elapsed_min = int(elapsed_seconds // 60)
+    progress = {}
+
+    # 1. 查 Inventory（服务端权威数据）— 每次刷新 integrity
+    try:
+        fresh_ci = get_client_integrity(client, auth_token, device_id)
+        inv = get_inventory(client, auth_token, device_id, fresh_ci or client_integrity)
+        earned = (inv.get("earnedDropRewards") or {}).get("edges") or []
+
+        # 检查 Corrupted Creeper Cape 是否已获得
+        cape_earned = False
+        cape_reward_id = None
+        cape_campaign_id = None
+        for e in earned:
+            node = e.get("node", {}) if isinstance(e, dict) else {}
+            item = node.get("item", {}) or {}
+            if item.get("name") == REWARD_NAME and node.get("status") in ("CLAIMABLE", "CLAIMED"):
+                cape_earned = True
+                cape_reward_id = item.get("id", "")
+                cape_campaign_id = node.get("campaign", {}).get("id", "")
+                break
+
+        if cape_earned and cape_reward_id:
+            print(f"\n[+] {REWARD_NAME} 已获得，正在领取...")
+            result, raw = claim_reward_code(client, auth_token, device_id, client_integrity,
+                                              get_target_campaign_id(client, auth_token, device_id,
+                                                                     client_integrity, channel_id, cape_campaign_id),
+                                              cape_reward_id)
+            code = result.get("code", "")
+            if code:
+                print(f"  [CDK] {REWARD_NAME}: {mask_cdk(code)}")
+                return [{"campaign": "", "reward": REWARD_NAME, "code": code}], {}, "claimed"
+            else:
+                errors = raw.get("errors", []) if isinstance(raw, dict) else []
+                is_oos = any("rewardValue" in str(e.get("path", [])) for e in errors)
+                if errors:
+                    print(f"  [!] 领取失败原因: {json.dumps(errors, ensure_ascii=False)[:400]}")
+                if is_oos:
+                    print(f"[!] {REWARD_NAME} 已获得但 Twitch 缺货")
+                    return [], {}, "out_of_stock"
+    except Exception:
+        pass
+
+    # 2. 读活动进度用于显示（DropChannelCampaignsProgress 带本账号已挂分钟数；
+    #    读不到就退回频道活动列表，此时进度用本地计时）
+    try:
+        prog_data = get_drops_progress(client, auth_token, device_id, client_integrity, channel_id)
+        campaigns = prog_data.get("channelDropCampaignsProgress") or []
+    except Exception:
+        campaigns = []
+    if not campaigns:
+        try:
+            campaign_data = get_channel_drops_campaigns(client, auth_token, device_id, client_integrity, channel_id)
+            campaigns = campaign_data.get("channelDropCampaigns") or []
+        except Exception:
+            campaigns = []
+
+    for camp in campaigns:
+        if not isinstance(camp, dict):
+            continue
+        for rg in camp.get("rewardGroups", []):
+            if not isinstance(rg, dict):
+                continue
+            reqs = (rg.get("progressCriteria") or {}).get("requirements") or {}
+            required_min = reqs.get("minutesWatched", 0)
+            rewards = [r.get("name", "") for r in rg.get("rewards", []) if isinstance(r, dict)]
+            label = rewards[0] if rewards else (rg.get("name") or "")
+            if REWARD_NAME not in rewards and label != REWARD_NAME:
+                continue
+            log_target_once(camp.get("id", ""), camp.get("name", ""), required_min)
+            if required_min > 0:
+                self_data = rg.get("self")
+                if isinstance(self_data, dict) and self_data.get("currentMinutesWatched") is not None:
+                    watched_min = int(self_data.get("currentMinutesWatched") or 0)
+                else:
+                    watched_min = min(elapsed_min, required_min)  # 拿不到服务端进度时退回本地计时
+                progress[label] = f"{watched_min}/{required_min}min"
+
+    return [], progress, ""
+
+
+# ========== 主流程 ==========
+
+def process_account(account, worker_name):
+    account_id = account.get("id", 0)
+    username = account.get("username", "unknown")
+    cookies_str = account.get("cookies", "[]")
+    channel_name = CHANNEL_NAME
+
+    try:
+        raw_cookies = json.loads(cookies_str)
+    except (json.JSONDecodeError, TypeError):
+        print(f"[{worker_name}] Cookie 解析失败")
+        return "invalid", None
+
+    converted = convert_cookies(raw_cookies)
+    auth_token, device_id, user_login, user_id = extract_cookie_values(converted)
+    if not auth_token:
+        print(f"[{worker_name}] {username}: 未找到 auth-token")
+        return "invalid", None
+    if not device_id:
+        device_id = uuid.uuid4().hex
+
+    cookie_jar = httpx.Cookies()
+    for c in converted:
+        cookie_jar.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+    client = httpx.Client(cookies=cookie_jar,
+                          headers={"User-Agent": USER_AGENT}, verify=False, timeout=60)
+
+    play_session_id = uuid.uuid4().hex
+    tab_session_id = uuid.uuid4().hex[:16]
+    app_session_id = uuid.uuid4().hex[:16]
+
+    client_integrity = ""
+    for attempt in range(3):
+        try:
+            client_integrity = get_client_integrity(client, auth_token, device_id)
+            if client_integrity:
+                break
+            if client_integrity is None:
+                # 401 — 直接退出，不重试
+                print(f"[{worker_name}] {username}: Integrity 返回 401，Cookie 失效")
+                client.close()
+                return "invalid", None
+        except Exception as e:
+            print(f"[{worker_name}] Integrity 失败 (尝试 {attempt+1}/3): {e}")
+        time.sleep(2)
+    if not client_integrity:
+        print(f"[{worker_name}] {username}: Integrity Token 获取失败，Cookie 可能失效")
+        client.close()
+        return "invalid", None
+
+    channel_id = ""
+    stream_game_name = "Minecraft"
+    stream_game_id = "27471"
+    broadcast_id = str(random.randint(3100000000, 3200000000))
+    try:
+        ops = [{
+            "operationName": "GetStreamInfo",
+            "query": "query GetStreamInfo($login: String!) { user(login: $login) { id stream { id title game { id name } } } }",
+            "variables": {"login": channel_name}
+        }]
+        r, status_code = gql_request_raw(client, auth_token, device_id, client_integrity, ops)
+        if status_code == 401:
+            print(f"[{worker_name}] {username}: GetStreamInfo 返回 401，Cookie 失效")
+            client.close()
+            return "invalid", None
+        if r and len(r) > 0:
+            user = r[0].get("data", {}).get("user", {})
+            channel_id = user.get("id", "")
+            stream = user.get("stream")
+            if stream:
+                broadcast_id = stream.get("id", broadcast_id)
+                game = stream.get("game") or {}
+                stream_game_name = game.get("name", "Minecraft")
+                stream_game_id = game.get("id", "27471")
+            else:
+                print(f"[{worker_name}] {channel_name} 当前离线")
+    except Exception:
+        try:
+            channel_id = get_channel_info(client, auth_token, device_id, client_integrity, channel_name)
+        except Exception:
+            pass
+
+    if not channel_id:
+        print(f"[{worker_name}] 无法获取频道信息")
+        client.close()
+        return "error", None
+
+    print(f"[{worker_name}] {username}: 检查已有挂宝...")
+    try:
+        fresh_ci = get_client_integrity(client, auth_token, device_id)
+        ci = fresh_ci or client_integrity
+        # 使用 gql_request_raw 以便检测 401
+        ops = [{
+            "operationName": "Inventory",
+            "variables": {"fetchRewardCampaigns": True},
+            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": "8337eb8541b314040b0edde0c09c5c7a2783ba1960aa9edfbf3bac16d0fec404"}}
+        }]
+        raw_result, status_code = gql_request_raw(client, auth_token, device_id, ci, ops)
+        if status_code == 401:
+            print(f"[{worker_name}] {username}: Cookie 失效 (401 Unauthorized)，标记删除")
+            client.close()
+            return "invalid", None
+        inv = {}
+        if raw_result and len(raw_result) > 0:
+            inv = raw_result[0].get("data", {}).get("currentUser", {}).get("inventory", {}) or {}
+        earned = (inv.get("earnedDropRewards") or {}).get("edges") or []
+        cape_done = False
+        cape_reward_id = None
+        cape_campaign_id = None
+        for e in earned:
+            if isinstance(e, dict):
+                node = e.get("node", {})
+                item = node.get("item", {}) or {}
+                if item.get("name") == REWARD_NAME and node.get("status") in ("CLAIMABLE", "CLAIMED"):
+                    cape_done = True
+                    cape_reward_id = item.get("id", "")
+                    cape_campaign_id = node.get("campaign", {}).get("id", "")
+                    break
+        if cape_done and cape_reward_id:
+            print(f"[{worker_name}] {username}: {REWARD_NAME} 已完成，正在领取...")
+            result, raw = claim_reward_code(client, auth_token, device_id, client_integrity,
+                                              get_target_campaign_id(client, auth_token, device_id,
+                                                                     client_integrity, channel_id, cape_campaign_id),
+                                              cape_reward_id)
+            code = result.get("code", "")
+            if code:
+                print(f"[{worker_name}] {username}: CDK = {mask_cdk(code)}")
+                client.close()
+                return "claimed", code
+            else:
+                errors = raw.get("errors", []) if isinstance(raw, dict) else []
+                is_oos = any("rewardValue" in str(e.get("path", [])) for e in errors)
+                if errors:
+                    print(f"[{worker_name}] {username}: 领取失败原因: "
+                          f"{json.dumps(errors, ensure_ascii=False)[:400]}")
+                if is_oos:
+                    print(f"[{worker_name}] {username}: 已获得但缺货")
+                    client.close()
+                    return "out_of_stock", None
+    except Exception as e:
+        print(f"[{worker_name}] 库存检查异常: {e}")
+
+    # 挂宝前先关注直播间（被挑战关卡挡住等失败情况跳过，不阻塞挂宝）
+    if FOLLOW_CHANNEL:
+        try:
+            reason = follow_channel(auth_token, device_id, channel_id)
+            if reason:
+                print(f"[{worker_name}] {username}: 关注 {channel_name} 跳过（{reason}）")
+            else:
+                print(f"[{worker_name}] {username}: 已关注 {channel_name}")
+        except Exception as e:
+            print(f"[{worker_name}] {username}: 关注异常，跳过（{e}）")
+
+    # 挂机时长自动检测：本期要挂多少分钟、这个号已经挂了多少，据此决定本次挂多久
+    farm_limit_min = MAX_DURATION
+    try:
+        _camp_id, _camp_name, required_min = find_target_campaign(
+            client, auth_token, device_id, client_integrity, channel_id, REWARD_NAME)
+        if required_min > 0:
+            done_min = get_self_progress_minutes(client, auth_token, device_id, client_integrity,
+                                                 channel_id, REWARD_NAME)
+            farm_limit_min = max(required_min - done_min, 0) + FARM_MARGIN_MINUTES
+            print(f"[{worker_name}] {username}: 本期需挂 {required_min} 分钟，已挂 {done_min} 分钟，"
+                  f"本次挂 {farm_limit_min} 分钟后结束")
+        else:
+            print(f"[{worker_name}] {username}: 未检测到本期所需时长，按不限制时长挂机")
+    except Exception as e:
+        print(f"[{worker_name}] {username}: 时长检测异常，按不限制时长挂机 ({e})")
+
+    print(f"[{worker_name}] {username}: 获取视频流...")
+    token = sig = None
+    hls_segments = []
+    try:
+        token, sig = get_playback_access_token(client, auth_token, device_id, client_integrity, channel_name)
+    except Exception:
+        pass
+
+    if token and sig:
+        try:
+            m3u8_content = get_hls_playlist(client, channel_name, token, sig)
+            if m3u8_content:
+                best_playlist_url = None
+                if "#EXT-X-STREAM-INF" in m3u8_content:
+                    base_url = f"https://usher.ttvnw.net/api/v2/channel/hls/{channel_name}.m3u8"
+                    best_playlist_url = select_best_quality_playlist(m3u8_content, base_url)
+                    if best_playlist_url:
+                        resp = client.get(best_playlist_url, timeout=15)
+                        m3u8_content = resp.text
+                playlist_base = best_playlist_url or f"https://usher.ttvnw.net/api/v2/channel/hls/{channel_name}.m3u8"
+                hls_segments = parse_m3u8_segments(m3u8_content, playlist_base)
+        except Exception:
+            pass
+
+    print(f"[{worker_name}] {username}: 开始挂机...")
+    start_time = time.time()
+    segment_idx = 0
+    total_downloaded = 0
+    last_segment = 0
+    last_heartbeat = 0
+    last_drops_check = 0
+    last_spade = 0
+    drops_progress = {}
+    integrity_failures = 0
+    last_integrity_refresh = 0
+    last_progress_line = ""
+    farm_done = False
+
+    try:
+        while True:
+            elapsed = int(time.time() - start_time)
+            now = time.time()
+
+            if farm_limit_min > 0 and elapsed >= farm_limit_min * 60:
+                farm_done = True
+                print(f"\n[{worker_name}] {username}: 已挂满本次所需 {farm_limit_min} 分钟，结束该账号")
+                break
+
+            if MAX_DURATION > 0 and elapsed >= MAX_DURATION:
+                break
+
+            if now - last_integrity_refresh >= 300:
+                try:
+                    fresh = get_client_integrity(client, auth_token, device_id)
+                    if fresh:
+                        client_integrity = fresh
+                        integrity_failures = 0
+                    else:
+                        integrity_failures += 1
+                except Exception:
+                    integrity_failures += 1
+                last_integrity_refresh = now
+                if integrity_failures >= 3:
+                    print(f"\n[{worker_name}] Integrity 连续失败，Cookie 可能失效")
+                    client.close()
+                    return "invalid", None
+
+            if hls_segments and now - last_segment >= SEGMENT_INTERVAL:
+                seg_url = hls_segments[segment_idx % len(hls_segments)]
+                total_downloaded += download_segment(client, seg_url)
+                segment_idx += 1
+                last_segment = now
+
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                try:
+                    send_player_stats(client, "video_heartbeat", device_id, play_session_id, channel_name)
+                except Exception:
+                    pass
+                last_heartbeat = now
+
+            if channel_id and now - last_spade >= SPADE_INTERVAL:
+                if last_spade == 0 and elapsed < 15:
+                    pass
+                else:
+                    try:
+                        send_spade_events(client, auth_token, device_id, client_integrity,
+                                           channel_name, channel_id, play_session_id,
+                                           tab_session_id, app_session_id, elapsed,
+                                           user_login, user_id,
+                                           stream_game_name, stream_game_id, broadcast_id)
+                    except Exception as e:
+                        print(f"\n  [{worker_name}] Spade 发送失败: {e}")
+                    last_spade = now
+
+            if channel_id and now - last_drops_check >= DROPS_CHECK_INTERVAL:
+                try:
+                    codes, drops_progress, claim_status = check_and_claim_drops(
+                        client, auth_token, device_id, client_integrity, channel_id, elapsed)
+                except Exception:
+                    codes, drops_progress, claim_status = [], {}, ""
+                last_drops_check = now
+                if drops_progress:
+                    line = " ".join(str(v) for v in drops_progress.values())
+                    if line != last_progress_line:
+                        last_progress_line = line
+                        print(f"[{worker_name}] {username}: 已挂 {line}")
+                if codes:
+                    code_info = codes[0] if codes else {}
+                    code = code_info.get("code", "")
+                    if code:
+                        print(f"\n[{worker_name}] {username}: CDK = {mask_cdk(code)}")
+                        client.close()
+                        return "claimed", code
+                if claim_status == "out_of_stock":
+                    print(f"\n[{worker_name}] {REWARD_NAME} 已获得但 Twitch 缺货")
+                    client.close()
+                    return "out_of_stock", None
+
+            time.sleep(2)
+
+    except KeyboardInterrupt:
+        pass
+
+    client.close()
+    if farm_done:
+        return "farm_done", None
+    return "error", None
+
+
+def heartbeat_loop(api_client, worker_name, stop_event):
+    while not stop_event.is_set():
+        send_heartbeat(api_client, worker_name)
+        stop_event.wait(HEARTBEAT_API_INTERVAL)
+
+
+def worker_thread(thread_id):
+    worker_name = f"w{thread_id}_{uuid.uuid4().hex[:8]}"
+    api_client = httpx.Client(timeout=30)
+
+    while True:
+        account = fetch_idle_account(api_client)
+        if not account:
+            print(f"[{worker_name}] 无空闲账号，30s 后重试...")
+            time.sleep(30)
+            continue
+
+        account_id = account.get("id", 0)
+        username = account.get("username", "unknown")
+        print(f"[{worker_name}] 获取账号: {username} (ID: {account_id})")
+
+        hb_stop = threading.Event()
+        hb_thread = threading.Thread(target=heartbeat_loop,
+                                       args=(api_client, worker_name, hb_stop),
+                                       daemon=True)
+        hb_thread.start()
+
+        try:
+            result, cdk_code = process_account(account, worker_name)
+            if result == "claimed":
+                if report_cdk(api_client, cdk_code, account_id, worker_name):
+                    print(f"[{worker_name}] CDK 已上报: {mask_cdk(cdk_code)}")
+                update_account_status(api_client, account_id, "success", worker_name)
+            elif result == "invalid":
+                remove_invalid_account(api_client, account_id)
+                print(f"[{worker_name}] 账号 {username} Cookie 失效，已移除")
+            elif result == "out_of_stock":
+                print(f"[{worker_name}] {REWARD_NAME} 缺货")
+                update_account_status(api_client, account_id, "nostock", worker_name)
+            elif result == "farm_done":
+                # 挂满本期要求但还没出码，进度已记在 Twitch 服务端，不标记异常、不动账号状态
+                print(f"[{worker_name}] 已挂满本期所需时长，未出码，账号留给下轮继续")
+            else:
+                print(f"[{worker_name}] 处理异常，跳过")
+        finally:
+            hb_stop.set()
+            send_heartbeat(api_client, worker_name)
+
+    api_client.close()
+
+
+def resolve_campaign_id_override():
+    """活动 UUID 运行时覆盖：命令行第 3 个参数优先，其次环境变量 REWARD_CAMPAIGN_ID"""
+    raw = sys.argv[3] if len(sys.argv) > 3 else ""
+    if not raw.strip():
+        raw = os.environ.get("REWARD_CAMPAIGN_ID", "")
+    return raw.strip()
+
+
+def main():
+    global BASE_URL, REWARD_CAMPAIGN_ID
+    if len(sys.argv) < 3:
+        print("用法: python main.py <FRONT_IP> <THREAD> [REWARD_CAMPAIGN_ID]")
+        sys.exit(1)
+
+    front_ip = sys.argv[1]
+    threads_count = int(sys.argv[2])
+    BASE_URL = f"http://{front_ip}:5000"
+
+    override = resolve_campaign_id_override()
+    if override:
+        if not UUID_RE.match(override):
+            print(f"[!] REWARD_CAMPAIGN_ID 不是合法 UUID: {override}")
+            sys.exit(1)
+        REWARD_CAMPAIGN_ID = override
+    print(f"线程数: {threads_count}")
+    print(f"目标奖励: {REWARD_NAME}")
+    print(f"活动 ID: {REWARD_CAMPAIGN_ID or '自动解析（按奖励名反查频道活动列表）'}")
+
+    threads = []
+    for i in range(threads_count):
+        t = threading.Thread(target=worker_thread, args=(i + 1,))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+
+    try:
+        for t in threads:
+            while t.is_alive():
+                t.join(timeout=1)
+    except KeyboardInterrupt:
+        print("\n[!] 用户中断")
+
+    print("[+] 所有线程已完成")
+
+
+if __name__ == "__main__":
+    main()
